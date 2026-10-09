@@ -1,0 +1,1379 @@
+const express = require("express");
+const cors = require("cors");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const { Pool, Client } = require("pg");
+require("dotenv").config();
+
+const app = express();
+
+app.use(cors());
+app.use(express.json());
+
+const PORT = process.env.PORT || 5000;
+const JWT_SECRET = process.env.JWT_SECRET;
+
+const masterPool = new Pool({
+    connectionString: process.env.MASTER_DATABASE_URL,
+    ssl: { rejectUnauthorized: false }
+});
+
+
+// =====================================================
+// DATABASE HELPERS
+// =====================================================
+
+function validateOrgId(orgId) {
+    return /^[a-zA-Z0-9]+$/.test(orgId);
+}
+
+function getDatabaseName(orgId) {
+    return `org_${orgId.toLowerCase()}`;
+}
+
+async function createTenantDatabase(databaseName) {
+    if (!/^org_[a-zA-Z0-9_]+$/.test(databaseName)) {
+        throw new Error("Invalid database name");
+    }
+
+    try {
+        await masterPool.query(
+            `CREATE DATABASE "${databaseName}"`
+        );
+    } catch (error) {
+        // Database already exists
+        if (error.code !== "42P04") {
+            throw error;
+        }
+    }
+}
+
+function createTenantPool(databaseName) {
+    const url = new URL(process.env.MASTER_DATABASE_URL);
+    url.pathname = `/${databaseName}`;
+
+    return new Pool({
+        connectionString: url.toString(),
+        ssl: { rejectUnauthorized: false }
+    });
+}
+
+
+// =====================================================
+// CREATE TENANT TABLES
+// =====================================================
+
+async function createTenantTables(databaseName) {
+
+    const pool = createTenantPool(databaseName);
+
+    try {
+
+        await pool.query(`
+
+            CREATE TABLE IF NOT EXISTS roles (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(100) UNIQUE NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS permissions (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(100) UNIQUE NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS role_permissions (
+                role_id INTEGER REFERENCES roles(id) ON DELETE CASCADE,
+                permission_id INTEGER REFERENCES permissions(id) ON DELETE CASCADE,
+                PRIMARY KEY(role_id, permission_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(150) NOT NULL,
+                email VARCHAR(255) UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                role_id INTEGER REFERENCES roles(id),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS products (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(200) NOT NULL,
+                description TEXT,
+                price NUMERIC(12,2) NOT NULL,
+                stock INTEGER NOT NULL DEFAULT 0,
+                is_published BOOLEAN DEFAULT FALSE,
+                created_by INTEGER REFERENCES users(id),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS customers (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(150) NOT NULL,
+                email VARCHAR(255) UNIQUE NOT NULL,
+                password_hash TEXT,
+                phone VARCHAR(50),
+                address TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS orders (
+                id SERIAL PRIMARY KEY,
+                customer_id INTEGER REFERENCES customers(id),
+                status VARCHAR(30) DEFAULT 'ORDERED',
+                total_amount NUMERIC(12,2) DEFAULT 0,
+                shipping_address TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS order_items (
+                id SERIAL PRIMARY KEY,
+                order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
+                product_id INTEGER REFERENCES products(id),
+                quantity INTEGER NOT NULL,
+                unit_price NUMERIC(12,2) NOT NULL
+            );
+
+        `);
+
+        // Roles
+        await pool.query(`
+            INSERT INTO roles(name)
+            VALUES
+            ('Admin'),
+            ('Inventory Manager'),
+            ('Account Manager')
+            ON CONFLICT(name) DO NOTHING
+        `);
+
+        // Permissions
+        const permissions = [
+            "view_product",
+            "create_product",
+            "update_product",
+            "delete_product",
+            "publish_product",
+            "view_orders",
+            "update_order_status",
+            "manage_users"
+        ];
+
+        for (const permission of permissions) {
+            await pool.query(
+                `INSERT INTO permissions(name)
+                 VALUES($1)
+                 ON CONFLICT(name) DO NOTHING`,
+                [permission]
+            );
+        }
+
+        // Admin gets all permissions
+        await pool.query(`
+            INSERT INTO role_permissions(role_id, permission_id)
+            SELECT r.id, p.id
+            FROM roles r CROSS JOIN permissions p
+            WHERE r.name = 'Admin'
+            ON CONFLICT DO NOTHING
+        `);
+
+        // Inventory Manager permissions
+        await pool.query(`
+            INSERT INTO role_permissions(role_id, permission_id)
+            SELECT r.id, p.id
+            FROM roles r
+            JOIN permissions p
+            ON p.name IN (
+                'view_product',
+                'create_product',
+                'update_product',
+                'delete_product',
+                'publish_product'
+            )
+            WHERE r.name = 'Inventory Manager'
+            ON CONFLICT DO NOTHING
+        `);
+
+        // Account Manager permissions
+        await pool.query(`
+            INSERT INTO role_permissions(role_id, permission_id)
+            SELECT r.id, p.id
+            FROM roles r
+            JOIN permissions p
+            ON p.name IN (
+                'view_product',
+                'view_orders',
+                'update_order_status'
+            )
+            WHERE r.name = 'Account Manager'
+            ON CONFLICT DO NOTHING
+        `);
+
+        console.log(`Tenant database ready: ${databaseName}`);
+
+    } finally {
+        await pool.end();
+    }
+}
+
+
+// =====================================================
+// AUTH MIDDLEWARE
+// =====================================================
+
+function authenticate(req, res, next) {
+
+    const header = req.headers.authorization;
+
+    if (!header || !header.startsWith("Bearer ")) {
+        return res.status(401).json({
+            message: "Authentication required"
+        });
+    }
+
+    const token = header.split(" ")[1];
+
+    try {
+
+        const decoded = jwt.verify(token, JWT_SECRET);
+
+        req.user = decoded;
+
+        next();
+
+    } catch (error) {
+
+        return res.status(401).json({
+            message: "Invalid or expired token"
+        });
+    }
+}
+
+
+function authorize(...requiredPermissions) {
+
+    return async (req, res, next) => {
+
+        try {
+
+            const pool = createTenantPool(req.user.databaseName);
+
+            const result = await pool.query(`
+                SELECT p.name
+                FROM role_permissions rp
+                JOIN permissions p
+                ON p.id = rp.permission_id
+                WHERE rp.role_id = $1
+            `, [req.user.roleId]);
+
+            await pool.end();
+
+            const permissions = result.rows.map(r => r.name);
+
+            const allowed = requiredPermissions.every(
+                p => permissions.includes(p)
+            );
+
+            if (!allowed) {
+                return res.status(403).json({
+                    message: "Forbidden"
+                });
+            }
+
+            next();
+
+        } catch (error) {
+
+            console.error(error);
+
+            res.status(500).json({
+                message: "Authorization error"
+            });
+        }
+    };
+}
+
+
+// =====================================================
+// HEALTH
+// =====================================================
+
+app.get("/", (req, res) => {
+
+    res.json({
+        message: "Company Project API is running"
+    });
+
+});
+
+
+// =====================================================
+// SIGNUP
+// =====================================================
+
+app.post("/api/auth/signup", async (req, res) => {
+
+    const {
+        orgId,
+        orgName,
+        email,
+        password,
+        confirmPassword,
+        orgCountry
+    } = req.body;
+
+    try {
+
+        if (
+            !orgId ||
+            !orgName ||
+            !email ||
+            !password ||
+            !confirmPassword ||
+            !orgCountry
+        ) {
+            return res.status(400).json({
+                message: "All fields are required"
+            });
+        }
+
+        if (!validateOrgId(orgId)) {
+            return res.status(400).json({
+                message: "Org ID must be alphanumeric"
+            });
+        }
+
+        if (password !== confirmPassword) {
+            return res.status(400).json({
+                message: "Passwords do not match"
+            });
+        }
+
+        if (password.length < 6) {
+            return res.status(400).json({
+                message: "Password must contain at least 6 characters"
+            });
+        }
+
+        const duplicate = await masterPool.query(`
+            SELECT id
+            FROM organizations
+            WHERE org_id = $1 OR email = $2
+        `, [orgId, email]);
+
+        if (duplicate.rows.length > 0) {
+            return res.status(409).json({
+                message: "Organization ID or email already exists"
+            });
+        }
+
+        const databaseName = getDatabaseName(orgId);
+
+        // Create tenant DB
+        await createTenantDatabase(databaseName);
+
+        // Create tenant tables
+        await createTenantTables(databaseName);
+
+        // Insert organization into master DB
+        const orgResult = await masterPool.query(`
+            INSERT INTO organizations
+            (org_id, org_name, email, country, database_name)
+            VALUES($1,$2,$3,$4,$5)
+            RETURNING id
+        `, [
+            orgId,
+            orgName,
+            email,
+            orgCountry,
+            databaseName
+        ]);
+
+        const organizationId = orgResult.rows[0].id;
+
+        // Free trial
+        await masterPool.query(`
+            INSERT INTO subscriptions
+            (organization_id, plan, status, trial_start, trial_end)
+            VALUES(
+                $1,
+                'FREE_TRIAL',
+                'ACTIVE',
+                CURRENT_TIMESTAMP,
+                CURRENT_TIMESTAMP + INTERVAL '14 days'
+            )
+        `, [organizationId]);
+
+        // Create first Admin
+        const tenantPool = createTenantPool(databaseName);
+
+        const passwordHash = await bcrypt.hash(password, 10);
+
+        const roleResult = await tenantPool.query(
+            `SELECT id FROM roles WHERE name = 'Admin'`
+        );
+
+        await tenantPool.query(`
+            INSERT INTO users
+            (name, email, password_hash, role_id)
+            VALUES($1,$2,$3,$4)
+        `, [
+            orgName + " Admin",
+            email,
+            passwordHash,
+            roleResult.rows[0].id
+        ]);
+
+        await tenantPool.end();
+
+        res.status(201).json({
+            message: "Organization created successfully",
+            orgId,
+            database: databaseName,
+            subscription: "FREE_TRIAL"
+        });
+
+    } catch (error) {
+
+        console.error(error);
+
+        res.status(500).json({
+            message: "Signup failed",
+            error: error.message
+        });
+    }
+});
+
+
+// =====================================================
+// LOGIN
+// =====================================================
+
+app.post("/api/auth/login", async (req, res) => {
+
+    const {
+        orgId,
+        email,
+        password
+    } = req.body;
+
+    try {
+
+        const result = await masterPool.query(`
+            SELECT database_name
+            FROM organizations
+            WHERE org_id = $1
+        `, [orgId]);
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                message: "Organization not found"
+            });
+        }
+
+        const databaseName = result.rows[0].database_name;
+
+        const pool = createTenantPool(databaseName);
+
+        const userResult = await pool.query(`
+            SELECT
+                u.id,
+                u.name,
+                u.email,
+                u.password_hash,
+                u.role_id,
+                r.name AS role
+            FROM users u
+            JOIN roles r ON r.id = u.role_id
+            WHERE u.email = $1
+        `, [email]);
+
+        if (userResult.rows.length === 0) {
+            await pool.end();
+
+            return res.status(401).json({
+                message: "Invalid credentials"
+            });
+        }
+
+        const user = userResult.rows[0];
+
+        const validPassword = await bcrypt.compare(
+            password,
+            user.password_hash
+        );
+
+        if (!validPassword) {
+            await pool.end();
+
+            return res.status(401).json({
+                message: "Invalid credentials"
+            });
+        }
+
+        const token = jwt.sign(
+            {
+                userId: user.id,
+                orgId,
+                databaseName,
+                roleId: user.role_id,
+                role: user.role
+            },
+            JWT_SECRET,
+            { expiresIn: "8h" }
+        );
+
+        await pool.end();
+
+        res.json({
+            message: "Login successful",
+            token,
+            user: {
+                id: user.id,
+                name: user.name,
+                email: user.email,
+                role: user.role
+            }
+        });
+
+    } catch (error) {
+
+        console.error(error);
+
+        res.status(500).json({
+            message: "Login failed"
+        });
+    }
+});
+
+
+// =====================================================
+// CREATE USER / ASSIGN ROLE
+// =====================================================
+
+app.post(
+    "/api/users",
+    
+    authenticate,
+    authorize("manage_users"),
+    async (req, res) => {
+
+        const {
+            name,
+            email,
+            password,
+            role
+        } = req.body;
+
+        try {
+
+            const pool = createTenantPool(
+                req.user.databaseName
+            );
+
+            const roleResult = await pool.query(
+                `SELECT id FROM roles WHERE name = $1`,
+                [role]
+            );
+
+            if (roleResult.rows.length === 0) {
+                await pool.end();
+
+                return res.status(400).json({
+                    message: "Invalid role"
+                });
+            }
+
+            const passwordHash = await bcrypt.hash(password, 10);
+
+            const result = await pool.query(`
+                INSERT INTO users
+                (name,email,password_hash,role_id)
+                VALUES($1,$2,$3,$4)
+                RETURNING id,name,email
+            `, [
+                name,
+                email,
+                passwordHash,
+                roleResult.rows[0].id
+            ]);
+
+            await pool.end();
+
+            res.status(201).json({
+                message: "User created",
+                user: result.rows[0]
+            });
+
+        } catch (error) {
+
+            res.status(500).json({
+                message: error.message
+            });
+        }
+    }
+);
+
+// =====================================================
+// USERS - LIST EMPLOYEES
+// =====================================================
+
+app.get(
+    "/api/users",
+    authenticate,
+    authorize("manage_users"),
+    async (req, res) => {
+
+        try {
+
+            const pool = createTenantPool(
+                req.user.databaseName
+            );
+
+            const result = await pool.query(`
+                SELECT
+                    users.id,
+                    users.name,
+                    users.email,
+                    roles.name AS role
+                FROM users
+                JOIN roles
+                    ON users.role_id = roles.id
+                ORDER BY users.id ASC
+            `);
+
+            await pool.end();
+
+            res.json(result.rows);
+
+        } catch (error) {
+
+            console.error(error);
+
+            res.status(500).json({
+                message: "Failed to load employees"
+            });
+
+        }
+    }
+);
+
+// =====================================================
+// PRODUCTS - READ
+// =====================================================
+
+app.get(
+    "/api/products",
+    authenticate,
+    authorize("view_product"),
+    async (req, res) => {
+
+        try {
+
+            const pool = createTenantPool(
+                req.user.databaseName
+            );
+
+            const result = await pool.query(
+                `SELECT * FROM products ORDER BY id DESC`
+            );
+
+            await pool.end();
+
+            res.json(result.rows);
+
+        } catch (error) {
+
+            res.status(500).json({
+                message: error.message
+            });
+        }
+    }
+);
+
+
+// =====================================================
+// PRODUCTS - CREATE
+// =====================================================
+
+app.post(
+    "/api/products",
+    authenticate,
+    authorize("create_product"),
+    async (req, res) => {
+
+        const {
+            name,
+            description,
+            price,
+            stock
+        } = req.body;
+
+        try {
+
+            const pool = createTenantPool(
+                req.user.databaseName
+            );
+
+            const result = await pool.query(`
+                INSERT INTO products
+                (name,description,price,stock,created_by)
+                VALUES($1,$2,$3,$4,$5)
+                RETURNING *
+            `, [
+                name,
+                description,
+                price,
+                stock,
+                req.user.userId
+            ]);
+
+            await pool.end();
+
+            res.status(201).json(result.rows[0]);
+
+        } catch (error) {
+
+            res.status(500).json({
+                message: error.message
+            });
+        }
+    }
+);
+
+
+// =====================================================
+// PRODUCTS - UPDATE
+// =====================================================
+
+app.put(
+    "/api/products/:id",
+    authenticate,
+    authorize("update_product"),
+    async (req, res) => {
+
+        const {
+            name,
+            description,
+            price,
+            stock
+        } = req.body;
+
+        try {
+
+            const pool = createTenantPool(
+                req.user.databaseName
+            );
+
+            const result = await pool.query(`
+                UPDATE products
+                SET
+                    name = $1,
+                    description = $2,
+                    price = $3,
+                    stock = $4
+                WHERE id = $5
+                RETURNING *
+            `, [
+                name,
+                description,
+                price,
+                stock,
+                req.params.id
+            ]);
+
+            await pool.end();
+
+            res.json(result.rows[0]);
+
+        } catch (error) {
+
+            res.status(500).json({
+                message: error.message
+            });
+        }
+    }
+);
+
+
+// =====================================================
+// PRODUCTS - DELETE
+// =====================================================
+
+app.delete(
+    "/api/products/:id",
+    authenticate,
+    authorize("delete_product"),
+    async (req, res) => {
+
+        try {
+
+            const pool = createTenantPool(
+                req.user.databaseName
+            );
+
+            // Check if product is already used in an order
+            const check = await pool.query(
+                `SELECT 1 FROM order_items WHERE product_id = $1 LIMIT 1`,
+                [req.params.id]
+            );
+
+            if (check.rows.length > 0) {
+
+                await pool.end();
+
+                return res.status(400).json({
+                    message:
+                        "Product cannot be deleted because it has existing orders."
+                });
+            }
+
+            await pool.query(
+                `DELETE FROM products WHERE id = $1`,
+                [req.params.id]
+            );
+
+            await pool.end();
+
+            res.json({
+                message: "Product deleted successfully"
+            });
+
+        } catch (error) {
+
+            console.error(error);
+
+            res.status(500).json({
+                message: "Failed to delete product"
+            });
+        }
+    }
+);
+
+
+// =====================================================
+// PRODUCTS - PUBLISH
+// =====================================================
+
+app.patch(
+    "/api/products/:id/publish",
+    authenticate,
+    authorize("publish_product"),
+    async (req, res) => {
+
+        try {
+
+            const pool = createTenantPool(
+                req.user.databaseName
+            );
+
+            const product = await pool.query(
+                `SELECT * FROM products WHERE id = $1`,
+                [req.params.id]
+            );
+
+            if (product.rows.length === 0) {
+                await pool.end();
+
+                return res.status(404).json({
+                    message: "Product not found"
+                });
+            }
+
+            if (product.rows[0].stock <= 0) {
+                await pool.end();
+
+                return res.status(400).json({
+                    message: "Cannot publish product with zero stock"
+                });
+            }
+
+            const result = await pool.query(`
+                UPDATE products
+                SET is_published = TRUE
+                WHERE id = $1
+                RETURNING *
+            `, [req.params.id]);
+
+            await pool.end();
+
+            res.json(result.rows[0]);
+
+        } catch (error) {
+
+            res.status(500).json({
+                message: error.message
+            });
+        }
+    }
+);
+
+
+// =====================================================
+// PUBLIC PRODUCTS
+// =====================================================
+
+app.get("/public/products", async (req, res) => {
+
+    const { orgid } = req.query;
+
+    try {
+
+        const result = await masterPool.query(`
+            SELECT database_name
+            FROM organizations
+            WHERE org_id = $1
+        `, [orgid]);
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                message: "Organization not found"
+            });
+        }
+
+        const pool = createTenantPool(
+            result.rows[0].database_name
+        );
+
+        const products = await pool.query(`
+            SELECT id,name,description,price,stock
+            FROM products
+            WHERE is_published = TRUE
+            AND stock > 0
+        `);
+
+        await pool.end();
+
+        res.json(products.rows);
+
+    } catch (error) {
+
+        res.status(500).json({
+            message: error.message
+        });
+    }
+});
+
+
+// =====================================================
+// PUBLIC BUY
+// =====================================================
+
+app.post("/public/orders", async (req, res) => {
+
+    const {
+        orgId,
+        productId,
+        quantity,
+        name,
+        email,
+        phone,
+        address,
+        password
+    } = req.body;
+
+    const qty = Number(quantity);
+
+    let pool;
+
+    try {
+
+        const org = await masterPool.query(`
+            SELECT database_name
+            FROM organizations
+            WHERE org_id = $1
+        `, [orgId]);
+
+        if (org.rows.length === 0) {
+            return res.status(404).json({
+                message: "Organization not found"
+            });
+        }
+
+        pool = createTenantPool(
+            org.rows[0].database_name
+        );
+
+        await pool.query("BEGIN");
+
+        const productResult = await pool.query(`
+            SELECT *
+            FROM products
+            WHERE id = $1
+            FOR UPDATE
+        `, [productId]);
+
+        if (productResult.rows.length === 0) {
+
+            await pool.query("ROLLBACK");
+            await pool.end();
+
+            return res.status(404).json({
+                message: "Product not found"
+            });
+        }
+
+        const product = productResult.rows[0];
+
+        if (!product.is_published) {
+
+            await pool.query("ROLLBACK");
+            await pool.end();
+
+            return res.status(400).json({
+                message: "Product is not available"
+            });
+        }
+
+        if (product.stock < qty) {
+
+            await pool.query("ROLLBACK");
+            await pool.end();
+
+            return res.status(400).json({
+                message: "Insufficient stock"
+            });
+        }
+
+        let customer;
+
+        const existingCustomer = await pool.query(
+            `SELECT * FROM customers WHERE email = $1`,
+            [email]
+        );
+
+        if (existingCustomer.rows.length > 0) {
+
+            customer = existingCustomer.rows[0];
+
+        } else {
+
+            const passwordHash = password
+                ? await bcrypt.hash(password, 10)
+                : null;
+
+            const customerResult = await pool.query(`
+                INSERT INTO customers
+                (name,email,password_hash,phone,address)
+                VALUES($1,$2,$3,$4,$5)
+                RETURNING *
+            `, [
+                name,
+                email,
+                passwordHash,
+                phone,
+                address
+            ]);
+
+            customer = customerResult.rows[0];
+        }
+
+        const total = Number(product.price) * qty;
+
+        const orderResult = await pool.query(`
+            INSERT INTO orders
+            (customer_id,total_amount,shipping_address,status)
+            VALUES($1,$2,$3,'ORDERED')
+            RETURNING *
+        `, [
+            customer.id,
+            total,
+            address
+        ]);
+
+        const order = orderResult.rows[0];
+
+        await pool.query(`
+            INSERT INTO order_items
+            (order_id,product_id,quantity,unit_price)
+            VALUES($1,$2,$3,$4)
+        `, [
+            order.id,
+            product.id,
+            qty,
+            product.price
+        ]);
+
+        await pool.query(`
+            UPDATE products
+            SET stock = stock - $1
+            WHERE id = $2
+        `, [
+            qty,
+            product.id
+        ]);
+
+        await pool.query("COMMIT");
+
+        await pool.end();
+
+        res.status(201).json({
+            message: "Order placed successfully",
+            orderId: order.id,
+            status: order.status,
+            totalAmount: total
+        });
+
+    } catch (error) {
+
+        if (pool) {
+
+            try {
+                await pool.query("ROLLBACK");
+            } catch (rollbackError) {
+                console.error("Rollback failed:", rollbackError);
+            }
+
+            try {
+                await pool.end();
+            } catch (endError) {
+                console.error("Pool close failed:", endError);
+            }
+        }
+
+        console.error(error);
+
+        res.status(500).json({
+            message: "Order failed",
+            error: error.message
+        });
+    }
+});
+
+// =====================================================
+// ORDERS - ACCOUNT MANAGER
+// =====================================================
+
+app.get(
+    "/api/orders",
+    authenticate,
+    authorize("view_orders"),
+    async (req, res) => {
+
+        try {
+
+            const pool = createTenantPool(
+                req.user.databaseName
+            );
+
+            const result = await pool.query(`
+                SELECT
+                    o.id,
+                    c.name AS customer_name,
+                    c.email,
+                    o.total_amount,
+                    o.status,
+                    o.shipping_address,
+                    o.created_at
+                FROM orders o
+                JOIN customers c
+                ON c.id = o.customer_id
+                ORDER BY o.id DESC
+            `);
+
+            await pool.end();
+
+            res.json(result.rows);
+
+        } catch (error) {
+
+            res.status(500).json({
+                message: error.message
+            });
+        }
+    }
+);
+
+
+// =====================================================
+// UPDATE ORDER STATUS
+// =====================================================
+
+app.patch(
+    "/api/orders/:id/status",
+    authenticate,
+    authorize("update_order_status"),
+    async (req, res) => {
+
+        const { status } = req.body;
+
+        const allowedStatuses = [
+            "ORDERED",
+            "SHIPPED",
+            "DELIVERED"
+        ];
+
+        try {
+
+            if (!allowedStatuses.includes(status)) {
+                return res.status(400).json({
+                    message: "Invalid status"
+                });
+            }
+
+            const pool = createTenantPool(
+                req.user.databaseName
+            );
+
+            const current = await pool.query(
+                `SELECT status FROM orders WHERE id = $1`,
+                [req.params.id]
+            );
+
+            if (current.rows.length === 0) {
+                await pool.end();
+
+                return res.status(404).json({
+                    message: "Order not found"
+                });
+            }
+
+            const oldStatus = current.rows[0].status;
+
+            const validTransition =
+                (oldStatus === "ORDERED" && status === "SHIPPED") ||
+                (oldStatus === "SHIPPED" && status === "DELIVERED");
+
+            if (!validTransition) {
+                await pool.end();
+
+                return res.status(400).json({
+                    message: `Invalid transition from ${oldStatus} to ${status}`
+                });
+            }
+
+            const result = await pool.query(`
+                UPDATE orders
+                SET status = $1
+                WHERE id = $2
+                RETURNING *
+            `, [
+                status,
+                req.params.id
+            ]);
+
+            await pool.end();
+
+            res.json(result.rows[0]);
+
+        } catch (error) {
+
+            res.status(500).json({
+                message: error.message
+            });
+        }
+    }
+);
+
+
+// =====================================================
+// CUSTOMER ORDER TRACKING
+// =====================================================
+
+app.post("/public/track", async (req, res) => {
+
+    const {
+        orgId,
+        email,
+        password
+    } = req.body;
+
+    try {
+
+        const org = await masterPool.query(`
+            SELECT database_name
+            FROM organizations
+            WHERE org_id = $1
+        `, [orgId]);
+
+        if (org.rows.length === 0) {
+            return res.status(404).json({
+                message: "Organization not found"
+            });
+        }
+
+        const pool = createTenantPool(
+            org.rows[0].database_name
+        );
+
+        const customerResult = await pool.query(
+            `SELECT * FROM customers WHERE email = $1`,
+            [email]
+        );
+
+        if (customerResult.rows.length === 0) {
+            await pool.end();
+
+            return res.status(401).json({
+                message: "Invalid credentials"
+            });
+        }
+
+        const customer = customerResult.rows[0];
+
+        if (!customer.password_hash) {
+            await pool.end();
+
+            return res.status(401).json({
+                message: "Customer password not configured"
+            });
+        }
+
+        const valid = await bcrypt.compare(
+            password,
+            customer.password_hash
+        );
+
+        if (!valid) {
+            await pool.end();
+
+            return res.status(401).json({
+                message: "Invalid credentials"
+            });
+        }
+
+        const orders = await pool.query(`
+            SELECT
+                o.id,
+                o.status,
+                o.total_amount,
+                o.shipping_address,
+                o.created_at,
+                oi.product_id,
+                p.name AS product_name,
+                oi.quantity,
+                oi.unit_price
+            FROM orders o
+            JOIN order_items oi
+            ON oi.order_id = o.id
+            JOIN products p
+            ON p.id = oi.product_id
+            WHERE o.customer_id = $1
+            ORDER BY o.id DESC
+        `, [customer.id]);
+
+        await pool.end();
+
+        res.json({
+            customer: {
+                name: customer.name,
+                email: customer.email
+            },
+            orders: orders.rows
+        });
+
+    } catch (error) {
+
+        res.status(500).json({
+            message: error.message
+        });
+    }
+});
+
+
+// =====================================================
+// START SERVER
+// =====================================================
+
+app.listen(PORT, () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+});
