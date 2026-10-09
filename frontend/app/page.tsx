@@ -31,7 +31,7 @@ export default function Home() {
     setMessage("Creating your organization...");
 
     try {
-      const response = await fetch("http://localhost:5000/api/auth/signup", {
+      const response = await fetch("https://company-management-system-si7m.onrender.com/api/auth/signup", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(form),

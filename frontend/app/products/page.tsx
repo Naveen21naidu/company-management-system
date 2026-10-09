@@ -39,7 +39,7 @@ export default function ProductsPage() {
     setLoadingProducts(true);
     try {
       const response = await fetch(
-        `http://localhost:5000/public/products?orgid=${encodeURIComponent(id)}`
+        `https://company-management-system-si7m.onrender.com/public/products?orgid=${encodeURIComponent(id)}`
       );
       const data = await response.json();
 
@@ -104,7 +104,7 @@ export default function ProductsPage() {
     setOrderId(null);
 
     try {
-      const response = await fetch("http://localhost:5000/public/orders", {
+      const response = await fetch("https://company-management-system-si7m.onrender.com/public/orders", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

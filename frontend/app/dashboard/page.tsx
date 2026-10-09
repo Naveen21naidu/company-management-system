@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 
-const API = "http://localhost:5000";
+const API = "https://company-management-system-si7m.onrender.com";
 
 type Product = {
   id: number;
